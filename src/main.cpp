@@ -8,19 +8,24 @@
 MAX30105 particleSensor;// 创建传感器对象
 
 // ==================== 配置参数 ====================
-const byte RATE_SIZE = 4;
+const byte RATE_SIZE = 8;
 const int HRV_WINDOW = 20;
 const int FILTER_SIZE = 5;
 
-const long IR_MIN = 30000;//信号下限
+const long IR_MIN = 5000;//信号下限（可按实际硬件调整）
 const long IR_MAX = 250000;//信号上限
+const unsigned long SIGNAL_LOSS_RESET_MS = 1500;
+const long IR_TARGET_LOW = 32000;
+const long IR_TARGET_HIGH = 52000;
+const unsigned long LED_ADJUST_INTERVAL_MS = 3000;
+const long LED_TARGET_MARGIN = 3000;
 
-byte rates[RATE_SIZE];//心跳数据存储位
+float rates[RATE_SIZE];//心跳数据存储位
 byte rateSpot = 0;//心跳数据存储位索引
 
 long lastBeat = 0;// 上次心跳时间
 float beatsPerMinute;// 心率
-int beatAvg = 0;//心跳平均值
+float beatAvg = 0;//心跳平均值
 
 // HRV 相关参数
 long rrIntervals[HRV_WINDOW];//RR间隔数据存储位
@@ -35,10 +40,14 @@ unsigned long lastPrintTime = 0;//上次打印时间
 
 int beatCount = 0;//心跳计数
 unsigned long startTime = 0;//开始时间
+unsigned long lastLedAdjustTime = 0;
+uint8_t ledCurrent = 0x1F;
+float rrAvgMs = 0;
+int gainOutOfRangeCount = 0;
 
 // 函数声明
 float calculateHRV();
-long getFilteredIR();
+long getFilteredIR(long rawIR);
 void resetBuffers();
 void error_hendler(void);
 
@@ -72,10 +81,10 @@ void setup() {
 
   Serial.println("传感器已连接");
 
-  particleSensor.setup(60, 4, 2, 400, 411, 4096);// 配置传感器参数,括号内数据表示如下 : 
+  particleSensor.setup(20, 4, 2, 100, 411, 16384);// 配置传感器参数,括号内数据表示如下 : 
   //接收的LED功率,平均采样数,LED模式（0=单色,1=双色）,采样率,脉冲宽度,ADC范围
-  particleSensor.setPulseAmplitudeRed(0x3F);// 设置红光LED的功率
-  particleSensor.setPulseAmplitudeIR(0x3F);// 设置红外LED的功率
+  particleSensor.setPulseAmplitudeRed(ledCurrent);// 设置红光LED的功率
+  particleSensor.setPulseAmplitudeIR(ledCurrent);// 设置红外LED的功率
 
   // 初始化滤波和HRV缓冲区
   for (int i = 0; i < FILTER_SIZE; i++) irBuffer[i] = 0;
@@ -121,7 +130,37 @@ void loop() {
   }
 
   long rawIR = particleSensor.getIR();// 读取原始 IR 值
-  long irValue = getFilteredIR();// 获取滤波后的 IR 值
+  long irValue = getFilteredIR(rawIR);// 使用同一次采样做滤波，避免重复读数
+
+  if (millis() - lastLedAdjustTime > LED_ADJUST_INTERVAL_MS && (lastBeat == 0 || millis() - lastBeat > 1500)) {
+    bool tooHigh = irValue > (IR_TARGET_HIGH + LED_TARGET_MARGIN);
+    bool tooLow = irValue < (IR_TARGET_LOW - LED_TARGET_MARGIN);
+
+    if (tooHigh || tooLow) {
+      gainOutOfRangeCount++;
+    } else {
+      gainOutOfRangeCount = 0;
+    }
+
+    if (gainOutOfRangeCount >= 2) {
+      if (tooHigh && ledCurrent > 0x05) {
+        ledCurrent--;
+        particleSensor.setPulseAmplitudeIR(ledCurrent);
+        particleSensor.setPulseAmplitudeRed(ledCurrent);
+        Serial.print("[AutoGain] 降低LED电流到: ");
+        Serial.println(ledCurrent);
+      } else if (tooLow && ledCurrent < 0x7F) {
+        ledCurrent++;
+        particleSensor.setPulseAmplitudeIR(ledCurrent);
+        particleSensor.setPulseAmplitudeRed(ledCurrent);
+        Serial.print("[AutoGain] 提高LED电流到: ");
+        Serial.println(ledCurrent);
+      }
+      gainOutOfRangeCount = 0;
+    }
+
+    lastLedAdjustTime = millis();
+  }
 
   static unsigned long lastDisplayTime = 0;
   if (millis() - lastDisplayTime > 200) {
@@ -143,7 +182,7 @@ void loop() {
 
     if (beatAvg > 0) {
       Serial.print(" | BPM=");
-      Serial.print(beatAvg);
+      Serial.print(beatAvg, 1);
     }
 
     float hrv = calculateHRV();
@@ -161,28 +200,47 @@ void loop() {
     lastDisplayTime = millis();
   }
 // 信号质量检测和心跳检测
+  static unsigned long weakSignalStart = 0;
   if (irValue < IR_MIN) {
-    resetBuffers();
-    delay(50);
+    if (weakSignalStart == 0) {
+      weakSignalStart = millis();
+    }
+    if (millis() - weakSignalStart > SIGNAL_LOSS_RESET_MS) {
+      resetBuffers();
+      weakSignalStart = millis();
+    }
+    delay(10);
     return;
   }
+  weakSignalStart = 0;
 
   if (irValue > IR_MAX) {
     delay(50);
     return;
   }
 
-  if (checkForBeat(irValue) == true) {
+  if (lastBeat > 0 && millis() - lastBeat > 3000) {
+    beatAvg = 0;
+    beatsPerMinute = 0;
+  }
+
+  if (checkForBeat(rawIR) == true) {
     long now = millis();
     long delta = now - lastBeat;
     lastBeat = now;
 
-    Serial.println("                                    心跳检测!");
+    if (delta > 450 && delta < 1400) {
+      if (rrAvgMs > 0 && abs(delta - rrAvgMs) > 260) {
+        return;
+      }
 
-    if (delta > 300 && delta < 1500) {
+      Serial.println("                                    心跳检测!");
       rrIntervals[rrIndex] = delta;
       rrIndex = (rrIndex + 1) % HRV_WINDOW;
       if (rrIndex == 0) rrFull = true;
+
+      if (rrAvgMs == 0) rrAvgMs = delta;
+      else rrAvgMs = rrAvgMs * 0.8 + delta * 0.2;
 
       beatsPerMinute = 60.0 / (delta / 1000.0);
 
@@ -192,18 +250,18 @@ void loop() {
       Serial.println(beatsPerMinute, 1);
 
       if (beatsPerMinute > 40 && beatsPerMinute < 200) {
-        rates[rateSpot++] = (byte)beatsPerMinute;
+        rates[rateSpot++] = beatsPerMinute;
         rateSpot %= RATE_SIZE;
 
-        beatAvg = 0;
+        float avgSum = 0;
         int validCount = 0;
         for (byte x = 0; x < RATE_SIZE; x++) {
           if (rates[x] > 0) {
-            beatAvg += rates[x];
+            avgSum += rates[x];
             validCount++;
           }
         }
-        if (validCount > 0) beatAvg /= validCount;
+        if (validCount > 0) beatAvg = avgSum / validCount;
 
         beatCount++;
       }
@@ -214,7 +272,7 @@ void loop() {
     float hrv = calculateHRV();
 
     if (beatAvg > 0 && hrv > 0) {
-      Serial.print(beatAvg);
+      Serial.print(beatAvg, 1);
       Serial.print(",");
       Serial.print(hrv);
       Serial.print(",");
@@ -224,8 +282,8 @@ void loop() {
   }
 }
 
-long getFilteredIR() {//用平均值来减小误差
-  irBuffer[filterIndex] = particleSensor.getIR();
+long getFilteredIR(long rawIR) {//用平均值来减小误差
+  irBuffer[filterIndex] = rawIR;
   filterIndex = (filterIndex + 1) % FILTER_SIZE;
 
   long sum = 0;
@@ -265,6 +323,7 @@ void resetBuffers() {
   rrIndex = 0;
   rrFull = false;
   beatCount = 0;
+  rrAvgMs = 0;
   for (int i = 0; i < RATE_SIZE; i++) rates[i] = 0;
 }
 
