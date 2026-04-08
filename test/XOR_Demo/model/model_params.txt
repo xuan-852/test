@@ -1,0 +1,16 @@
+// SVM Model Parameters for Arduino
+
+// Feature Standardization Parameters
+const float MEAN_BPM = 439.696113f;
+const float MEAN_HRV = 0.000000f;
+const float STD_BPM = 192.815374f;
+const float STD_HRV = 1.000000f;
+
+// SVM Model Parameters
+const float W1 = 1.442042f;
+const float W2 = 0.000000f;
+const float B = -1.014987f;
+
+// Prediction Function:
+// z = W1 * ((bpm - MEAN_BPM) / STD_BPM) + W2 * ((hrv - MEAN_HRV) / STD_HRV) + B
+// label = (z >= 0) ? 1 : 0
